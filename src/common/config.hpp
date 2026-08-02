@@ -60,6 +60,7 @@ struct TimerConfig {
 
 struct OverlayConfig {
     bool enabled = true;
+    bool obs_capture_armed = false;
     std::string overlay_key = "Insert";
     std::uint32_t overlay_virtual_key = 0x2D;
     std::uint8_t overlay_modifiers = 0;

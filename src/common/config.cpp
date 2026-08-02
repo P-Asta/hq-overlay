@@ -467,6 +467,7 @@ LoadResult LoadOverlayConfig(const std::filesystem::path& root) {
     if (std::filesystem::is_regular_file(general_path)) {
         if (const auto general = ReadJson(general_path, result.warnings); general.has_value()) {
             ReadBool(*general, "enabled", result.value.enabled);
+            ReadBool(*general, "obs_capture_armed", result.value.obs_capture_armed);
             ReadString(*general, "overlay_key", result.value.overlay_key);
         }
     }

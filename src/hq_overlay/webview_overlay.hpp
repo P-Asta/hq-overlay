@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <vector>
 
 namespace hq::overlay::webview {
 
@@ -14,6 +15,14 @@ enum class State : unsigned char {
     DomReady,
     Failed,
     Stopping,
+};
+
+struct CapturedFrame {
+    std::uint32_t width = 0;
+    std::uint32_t height = 0;
+    std::uint32_t row_pitch = 0;
+    std::uint64_t generation = 0;
+    std::vector<std::uint8_t> rgba;
 };
 
 // Starts one STA WebView2/DirectComposition host for the selected game HWND.
@@ -28,6 +37,8 @@ void NotifyProcessDetach() noexcept;
 void UpdateBounds() noexcept;
 void SetSettingsOpen(bool open) noexcept;
 void SetSettingsHotkey(UINT virtual_key, std::uint8_t modifiers) noexcept;
+void SetBackBufferCaptureEnabled(bool enabled) noexcept;
+[[nodiscard]] bool BackBufferCaptureEnabled() noexcept;
 
 // A registered window message posted back to the game HWND when WebView focus
 // must be released. The game WndProc handles it on its owning thread.
@@ -46,5 +57,11 @@ void SetSettingsHotkey(UINT virtual_key, std::uint8_t modifiers) noexcept;
 [[nodiscard]] bool WantsInput() noexcept;
 [[nodiscard]] const char* StateName() noexcept;
 [[nodiscard]] HCURSOR CurrentCursor() noexcept;
+
+// Copies a newly captured transparent WebView frame for D3D11 back-buffer
+// composition. Returns false when the caller already has the latest frame.
+[[nodiscard]] bool CopyLatestCapturedFrame(
+    std::uint64_t known_generation,
+    CapturedFrame& frame) noexcept;
 
 }  // namespace hq::overlay::webview

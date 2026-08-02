@@ -45,6 +45,8 @@ std::atomic_bool g_soft_disabled{false};
 std::atomic_bool g_ready{false};
 std::atomic_bool g_imgui_input_ready{false};
 std::atomic_bool g_panel_open{false};
+std::atomic_bool g_game_input_suspended{false};
+std::atomic_int g_cursor_visibility_adjustments{0};
 std::atomic_bool g_crosshair_toggle_requested{false};
 std::atomic_bool g_config_reload_requested{false};
 std::atomic_bool g_window_invalidated{false};
@@ -82,6 +84,9 @@ struct RendererState {
     ComPtr<ID3D11Device> device;
     ComPtr<ID3D11DeviceContext> context;
     ComPtr<ID3D11RenderTargetView> render_target;
+    ComPtr<ID3D11Texture2D> webview_capture_texture;
+    ComPtr<ID3D11ShaderResourceView> webview_capture_view;
+    std::uint64_t webview_capture_generation = 0;
     HWND window = nullptr;
     WNDPROC original_wndproc = nullptr;
     bool imgui_context_created = false;
@@ -225,7 +230,8 @@ void PollConfigurationOnWorker(bool force) {
     message << "Config loaded from " << root.string() << "; crosshair="
             << (loaded.value.crosshair.enabled ? "on" : "off") << " style="
             << config::CrosshairStyleName(loaded.value.crosshair.style) << "; timer="
-            << (loaded.value.timer.enabled ? "on" : "off") << "; warnings="
+            << (loaded.value.timer.enabled ? "on" : "off") << "; OBS game capture="
+            << (loaded.value.obs_capture_armed ? "on" : "off") << "; warnings="
             << loaded.warnings.size();
     logging::Write(logging::Level::Info, message.str());
     for (const auto& warning : loaded.warnings) {
@@ -234,6 +240,7 @@ void PollConfigurationOnWorker(bool force) {
     const std::uint32_t overlay_hotkey = loaded.value.overlay_virtual_key;
     const std::uint8_t overlay_hotkey_modifiers = loaded.value.overlay_modifiers;
     const std::uint32_t crosshair_hotkey = loaded.value.crosshair.toggle_virtual_key;
+    const bool backbuffer_capture_enabled = loaded.value.obs_capture_armed;
     {
         std::scoped_lock lock(g_prepared_config_mutex);
         g_prepared_config = std::move(loaded);
@@ -247,6 +254,7 @@ void PollConfigurationOnWorker(bool force) {
     g_overlay_hotkey.store(overlay_hotkey, std::memory_order_release);
     g_overlay_hotkey_modifiers.store(overlay_hotkey_modifiers, std::memory_order_release);
     webview::SetSettingsHotkey(overlay_hotkey, overlay_hotkey_modifiers);
+    webview::SetBackBufferCaptureEnabled(backbuffer_capture_enabled);
     g_crosshair_hotkey.store(crosshair_hotkey, std::memory_order_release);
 }
 
@@ -551,7 +559,17 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
     if (original == &HookWindowProcedure) original = nullptr;
     const UINT restore_focus_message = webview::RestoreGameFocusMessage();
     if (restore_focus_message != 0 && message == restore_focus_message) {
-        if (GetFocus() != window) (void)SetFocus(window);
+        const bool was_suspended = g_game_input_suspended.exchange(false, std::memory_order_acq_rel);
+        int cursor_adjustments = g_cursor_visibility_adjustments.exchange(0, std::memory_order_acq_rel);
+        while (cursor_adjustments-- > 0) (void)ShowCursor(FALSE);
+        if (GetFocus() != window) {
+            (void)SetFocus(window);
+        } else if (was_suspended && original != nullptr) {
+            // A composition WebView has no child HWND, so the OS focus can
+            // remain on the game while its input is intentionally suspended.
+            // Restore the matching focus notification when the panel closes.
+            (void)CallWindowProcW(original, window, WM_SETFOCUS, 0, 0);
+        }
         return 0;
     }
     const bool key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
@@ -582,6 +600,24 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
                                      : g_panel_open.load(std::memory_order_acquire);
             const bool next = !current;
             g_panel_open.store(next, std::memory_order_release);
+            if (next && !g_game_input_suspended.exchange(true, std::memory_order_acq_rel)) {
+                // Match an in-game platform overlay: release mouse confinement
+                // and tell the game it no longer owns keyboard/mouse focus while
+                // the composition-hosted settings UI remains interactive.
+                if (GetCapture() == window) ReleaseCapture();
+                (void)ClipCursor(nullptr);
+                int cursor_adjustments = 0;
+                while (cursor_adjustments < 32) {
+                    ++cursor_adjustments;
+                    if (ShowCursor(TRUE) >= 0) break;
+                }
+                g_cursor_visibility_adjustments.store(cursor_adjustments, std::memory_order_release);
+                (void)SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                if (original != nullptr) {
+                    (void)CallWindowProcW(original, window, WM_CANCELMODE, 0, 0);
+                    (void)CallWindowProcW(original, window, WM_KILLFOCUS, 0, 0);
+                }
+            }
             webview::SetSettingsOpen(next);
             overlay_hotkey_handled = true;
         }
@@ -600,8 +636,19 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
     }
 
     if (webview::IsDomReady() && webview::WantsInput()) {
+        if (message == WM_INPUT) {
+            // Unity consumes raw mouse/keyboard packets independently of the
+            // legacy WM_KEY/WM_MOUSE messages. Do the required foreground raw
+            // input cleanup, but do not forward the packet into the game.
+            if (GET_RAWINPUT_CODE_WPARAM(wparam) == RIM_INPUT) {
+                (void)DefWindowProcW(window, message, wparam, lparam);
+            }
+            return 0;
+        }
         if (message == WM_SETCURSOR) {
-            SetCursor(webview::CurrentCursor());
+            HCURSOR cursor = webview::CurrentCursor();
+            if (cursor == nullptr) cursor = LoadCursorW(nullptr, IDC_ARROW);
+            SetCursor(cursor);
             return TRUE;
         }
         if (mouse_message) {
@@ -665,6 +712,90 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
     if (FAILED(result)) return false;
     result = g_renderer.device->CreateRenderTargetView(back_buffer.Get(), nullptr, &g_renderer.render_target);
     return SUCCEEDED(result);
+}
+
+[[nodiscard]] bool InitializeBackBufferRenderer() {
+    if (!CreateRenderTarget()) return false;
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    g_renderer.imgui_context_created = true;
+    ImGuiIO& io = ImGui::GetIO();
+    io.IniFilename = nullptr;
+    io.LogFilename = nullptr;
+    if (!ImGui_ImplDX11_Init(g_renderer.device.Get(), g_renderer.context.Get())) return false;
+    g_renderer.dx11_backend_initialized = true;
+    return true;
+}
+
+void UpdateWebViewCaptureTexture() {
+    webview::CapturedFrame frame;
+    if (!webview::CopyLatestCapturedFrame(g_renderer.webview_capture_generation, frame)) return;
+    g_renderer.webview_capture_generation = frame.generation;
+    g_renderer.webview_capture_view.Reset();
+    g_renderer.webview_capture_texture.Reset();
+    if (frame.width == 0 || frame.height == 0 || frame.rgba.empty()) return;
+
+    D3D11_TEXTURE2D_DESC description{};
+    description.Width = frame.width;
+    description.Height = frame.height;
+    description.MipLevels = 1;
+    description.ArraySize = 1;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Usage = D3D11_USAGE_IMMUTABLE;
+    description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA initial{};
+    initial.pSysMem = frame.rgba.data();
+    initial.SysMemPitch = frame.row_pitch;
+    HRESULT result = g_renderer.device->CreateTexture2D(
+        &description, &initial, &g_renderer.webview_capture_texture);
+    if (FAILED(result)) {
+        logging::Write(logging::Level::Warning, "Could not create WebView capture texture");
+        return;
+    }
+    result = g_renderer.device->CreateShaderResourceView(
+        g_renderer.webview_capture_texture.Get(), nullptr, &g_renderer.webview_capture_view);
+    if (FAILED(result)) {
+        g_renderer.webview_capture_texture.Reset();
+        logging::Write(logging::Level::Warning, "Could not create WebView capture shader view");
+    }
+}
+
+void RenderWebViewCaptureFrame() {
+    if (!webview::BackBufferCaptureEnabled()) return;
+    if (!g_renderer.imgui_context_created || !g_renderer.dx11_backend_initialized ||
+        !g_renderer.render_target || !g_renderer.context) {
+        return;
+    }
+    UpdateWebViewCaptureTexture();
+    if (!g_renderer.webview_capture_view) return;
+
+    RECT client{};
+    if (!GetClientRect(g_renderer.window, &client) ||
+        client.right <= client.left || client.bottom <= client.top) {
+        return;
+    }
+    ImGuiIO& io = ImGui::GetIO();
+    io.DisplaySize = ImVec2(
+        static_cast<float>(client.right - client.left),
+        static_cast<float>(client.bottom - client.top));
+    io.DeltaTime = 1.0F / 60.0F;
+    ImGui_ImplDX11_NewFrame();
+    ImGui::NewFrame();
+    const ImTextureID texture_id = static_cast<ImTextureID>(
+        reinterpret_cast<std::uintptr_t>(g_renderer.webview_capture_view.Get()));
+    ImGui::GetBackgroundDrawList()->AddImage(
+        ImTextureRef(texture_id),
+        ImVec2(0.0F, 0.0F),
+        io.DisplaySize,
+        ImVec2(0.0F, 0.0F),
+        ImVec2(1.0F, 1.0F),
+        IM_COL32_WHITE);
+    ImGui::Render();
+    ScopedOutputMergerState previous_output_merger(g_renderer.context.Get());
+    ID3D11RenderTargetView* target = g_renderer.render_target.Get();
+    g_renderer.context->OMSetRenderTargets(1, &target, nullptr);
+    ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 }
 
 void RestoreWindowProcedure() {
@@ -739,6 +870,9 @@ void ShutdownRenderer() {
         ImGui::DestroyContext();
         g_renderer.imgui_context_created = false;
     }
+    g_renderer.webview_capture_view.Reset();
+    g_renderer.webview_capture_texture.Reset();
+    g_renderer.webview_capture_generation = 0;
     g_renderer.render_target.Reset();
     g_renderer.context.Reset();
     g_renderer.device.Reset();
@@ -867,6 +1001,12 @@ void NormalizeExclusiveFullscreen(IDXGISwapChain* swap_chain) {
     g_imgui_input_ready.store(false, std::memory_order_release);
     ApplyPreparedConfiguration();
 
+    if (!InitializeBackBufferRenderer()) {
+        logging::Write(logging::Level::Error, "D3D11 back-buffer overlay renderer could not be initialized");
+        ShutdownRenderer();
+        return false;
+    }
+
     if (g_soft_disabled.load(std::memory_order_acquire) || ExternalDisableSignaled()) {
         RequestSoftDisable("disable event observed during renderer initialization");
         ShutdownRenderer();
@@ -952,6 +1092,7 @@ HRESULT WINAPI HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT 
                 if (g_renderer.swap_chain.Get() == swap_chain &&
                     g_selected_resize_count.load(std::memory_order_acquire) == 0) {
                     PromoteWebViewReady();
+                    RenderWebViewCaptureFrame();
                     if (webview::HasFailed()) {
                         RequestSoftDisable("WebView2 initialization or browser process failure");
                     }

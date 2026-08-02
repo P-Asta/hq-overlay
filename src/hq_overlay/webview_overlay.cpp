@@ -11,6 +11,7 @@
 #include <dcomp.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <wincodec.h>
 #include <windowsx.h>
 #include <wrl.h>
 #include <wrl/client.h>
@@ -19,6 +20,7 @@
 #include <atomic>
 #include <chrono>
 #include <cctype>
+#include <climits>
 #include <cstdint>
 #include <cwctype>
 #include <filesystem>
@@ -44,7 +46,14 @@ constexpr UINT kMessageSettings = WM_APP + 0x543;
 constexpr UINT kMessageMouse = WM_APP + 0x544;
 constexpr UINT kMessageShortcut = WM_APP + 0x545;
 constexpr UINT kMessageLcStats = WM_APP + 0x546;
-constexpr UINT kFocusHintPollIntervalMs = 250;
+constexpr UINT kHostTimerIntervalMs = 16;
+
+enum class CapturePhase {
+    SetBlack,
+    CaptureBlack,
+    SetWhite,
+    CaptureWhite,
+};
 constexpr UINT kFocusHintDurationMs = 10000;
 constexpr UINT kEmbeddedOverlayResourceId = 101;
 constexpr std::uintmax_t kMaximumRpcFileSize = 16U * 1024U * 1024U;
@@ -65,8 +74,12 @@ std::atomic<HCURSOR> g_cursor{nullptr};
 std::atomic_bool g_accept_lcstats{false};
 std::mutex g_thread_mutex;
 std::mutex g_shortcuts_mutex;
+std::mutex g_captured_frame_mutex;
 HANDLE g_thread_handle = nullptr;
 std::vector<std::string> g_shortcuts;
+CapturedFrame g_captured_frame;
+std::uint64_t g_captured_frame_generation = 0;
+std::atomic_bool g_backbuffer_capture_enabled{false};
 
 [[nodiscard]] std::uint8_t CurrentModifierMask() {
     std::uint8_t modifiers = 0;
@@ -698,6 +711,149 @@ void QueueLcStatsUpdate(hq::lcstats::Update update) noexcept {
     return !html.empty();
 }
 
+[[nodiscard]] bool DecodeCapturedPng(
+    IWICImagingFactory* factory,
+    IStream* stream,
+    CapturedFrame& frame) {
+    if (factory == nullptr || stream == nullptr) return false;
+    LARGE_INTEGER start{};
+    if (FAILED(stream->Seek(start, STREAM_SEEK_SET, nullptr))) return false;
+
+    ComPtr<IWICBitmapDecoder> decoder;
+    HRESULT result = factory->CreateDecoderFromStream(
+        stream, nullptr, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(result) || !decoder) return false;
+    ComPtr<IWICBitmapFrameDecode> decoded;
+    result = decoder->GetFrame(0, &decoded);
+    if (FAILED(result) || !decoded) return false;
+
+    UINT width = 0;
+    UINT height = 0;
+    result = decoded->GetSize(&width, &height);
+    if (FAILED(result) || width == 0 || height == 0 ||
+        width > 16384 || height > 16384) {
+        return false;
+    }
+
+    ComPtr<IWICFormatConverter> converter;
+    result = factory->CreateFormatConverter(&converter);
+    if (FAILED(result) || !converter) return false;
+    result = converter->Initialize(
+        decoded.Get(),
+        GUID_WICPixelFormat32bppRGBA,
+        WICBitmapDitherTypeNone,
+        nullptr,
+        0.0,
+        WICBitmapPaletteTypeCustom);
+    if (FAILED(result)) return false;
+
+    const std::uint64_t row_pitch = static_cast<std::uint64_t>(width) * 4U;
+    const std::uint64_t byte_count = row_pitch * height;
+    if (row_pitch > UINT_MAX || byte_count > UINT_MAX) return false;
+    frame.width = width;
+    frame.height = height;
+    frame.row_pitch = static_cast<std::uint32_t>(row_pitch);
+    frame.rgba.resize(static_cast<std::size_t>(byte_count));
+    result = converter->CopyPixels(
+        nullptr,
+        frame.row_pitch,
+        static_cast<UINT>(frame.rgba.size()),
+        frame.rgba.data());
+    return SUCCEEDED(result);
+}
+
+[[nodiscard]] bool ReconstructTransparentFrame(
+    const CapturedFrame& black,
+    const CapturedFrame& white,
+    CapturedFrame& transparent) {
+    if (black.width == 0 || black.height == 0 ||
+        black.width != white.width || black.height != white.height ||
+        black.row_pitch != white.row_pitch || black.rgba.size() != white.rgba.size()) {
+        return false;
+    }
+
+    transparent.width = black.width;
+    transparent.height = black.height;
+    transparent.row_pitch = black.row_pitch;
+    transparent.rgba.resize(black.rgba.size());
+    for (std::size_t offset = 0; offset + 3 < black.rgba.size(); offset += 4) {
+        int difference_red = std::clamp(
+            static_cast<int>(white.rgba[offset]) - static_cast<int>(black.rgba[offset]), 0, 255);
+        int difference_green = std::clamp(
+            static_cast<int>(white.rgba[offset + 1]) - static_cast<int>(black.rgba[offset + 1]), 0, 255);
+        int difference_blue = std::clamp(
+            static_cast<int>(white.rgba[offset + 2]) - static_cast<int>(black.rgba[offset + 2]), 0, 255);
+        if (difference_red > difference_green) std::swap(difference_red, difference_green);
+        if (difference_green > difference_blue) std::swap(difference_green, difference_blue);
+        if (difference_red > difference_green) std::swap(difference_red, difference_green);
+        const int alpha = 255 - difference_green;
+        if (alpha <= 1) {
+            transparent.rgba[offset] = 0;
+            transparent.rgba[offset + 1] = 0;
+            transparent.rgba[offset + 2] = 0;
+            transparent.rgba[offset + 3] = 0;
+            continue;
+        }
+        for (std::size_t channel = 0; channel < 3; ++channel) {
+            const int straight =
+                (static_cast<int>(black.rgba[offset + channel]) * 255 + alpha / 2) / alpha;
+            transparent.rgba[offset + channel] = static_cast<std::uint8_t>(std::clamp(straight, 0, 255));
+        }
+        transparent.rgba[offset + 3] = static_cast<std::uint8_t>(alpha);
+    }
+    return true;
+}
+
+[[nodiscard]] bool LooksLikeOpaqueBlackBackground(const CapturedFrame& frame) {
+    if (frame.rgba.size() < 4) return false;
+    std::size_t samples = 0;
+    std::size_t black_samples = 0;
+    constexpr std::size_t pixel_step = 64;
+    for (std::size_t offset = 0; offset + 3 < frame.rgba.size(); offset += pixel_step * 4) {
+        ++samples;
+        if (frame.rgba[offset] <= 8 && frame.rgba[offset + 1] <= 8 &&
+            frame.rgba[offset + 2] <= 8) {
+            ++black_samples;
+        }
+    }
+    return samples != 0 && black_samples * 5 >= samples;
+}
+
+[[nodiscard]] bool BackgroundPairIsReady(
+    const CapturedFrame& black,
+    const CapturedFrame& white) {
+    if (black.rgba.size() != white.rgba.size() || black.rgba.size() < 4) return false;
+    std::size_t samples = 0;
+    std::size_t changed_samples = 0;
+    constexpr std::size_t pixel_step = 64;
+    for (std::size_t offset = 0; offset + 3 < black.rgba.size(); offset += pixel_step * 4) {
+        ++samples;
+        int red = std::clamp(
+            static_cast<int>(white.rgba[offset]) - static_cast<int>(black.rgba[offset]), 0, 255);
+        int green = std::clamp(
+            static_cast<int>(white.rgba[offset + 1]) - static_cast<int>(black.rgba[offset + 1]), 0, 255);
+        int blue = std::clamp(
+            static_cast<int>(white.rgba[offset + 2]) - static_cast<int>(black.rgba[offset + 2]), 0, 255);
+        if (red > green) std::swap(red, green);
+        if (green > blue) std::swap(green, blue);
+        if (red > green) std::swap(red, green);
+        if (green >= 200) ++changed_samples;
+    }
+    return samples != 0 && changed_samples * 5 >= samples;
+}
+
+void PublishCapturedFrame(CapturedFrame frame) {
+    std::scoped_lock lock(g_captured_frame_mutex);
+    frame.generation = ++g_captured_frame_generation;
+    g_captured_frame = std::move(frame);
+}
+
+void ClearCapturedFrame() {
+    std::scoped_lock lock(g_captured_frame_mutex);
+    g_captured_frame = {};
+    g_captured_frame.generation = ++g_captured_frame_generation;
+}
+
 class WebViewHost final {
 public:
     [[nodiscard]] HRESULT Initialize(HMODULE module, HWND window) {
@@ -719,6 +875,14 @@ public:
         std::filesystem::create_directories(user_data_root_, filesystem_error);
         if (filesystem_error) return HRESULT_FROM_WIN32(filesystem_error.value());
 
+        ClearCapturedFrame();
+        HRESULT result = CoCreateInstance(
+            CLSID_WICImagingFactory,
+            nullptr,
+            CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(&wic_factory_));
+        if (FAILED(result) || !wic_factory_) return FAILED(result) ? result : E_NOINTERFACE;
+
         g_accept_lcstats.store(true, std::memory_order_release);
         if (!lcstats_client_.Start(QueueLcStatsUpdate)) {
             g_accept_lcstats.store(false, std::memory_order_release);
@@ -727,7 +891,7 @@ public:
             Log(logging::Level::Info, "LCStatsTracker SSE worker started for localhost:2145");
         }
 
-        HRESULT result = CreateCompositionTree();
+        result = CreateCompositionTree();
         if (FAILED(result)) return result;
 
         auto completion = Callback<ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler>(
@@ -753,6 +917,18 @@ public:
         RECT bounds{};
         if (!GetClientRect(window_, &bounds)) return;
         if (bounds.right <= bounds.left || bounds.bottom <= bounds.top) return;
+        const bool bounds_changed = !capture_bounds_valid_ ||
+            bounds.left != capture_bounds_.left || bounds.top != capture_bounds_.top ||
+            bounds.right != capture_bounds_.right || bounds.bottom != capture_bounds_.bottom;
+        if (bounds_changed) {
+            capture_bounds_ = bounds;
+            capture_bounds_valid_ = true;
+            capture_phase_ = CapturePhase::SetBlack;
+            pending_black_frame_ = {};
+            // Never stretch a snapshot from the previous WebView surface size.
+            // A fresh CapturePreview will repopulate it after put_Bounds completes.
+            ClearCapturedFrame();
+        }
         const HRESULT result = controller_->put_Bounds(bounds);
         if (FAILED(result)) {
             Log(logging::Level::Warning, "WebView2 bounds update failed: " + HResultText(result));
@@ -777,6 +953,133 @@ public:
             "overlay://open-config-hint",
             "{\"durationMs\":" + std::to_string(kFocusHintDurationMs) + "}");
         Log(logging::Level::Info, "Displayed first-focus overlay settings hotkey hint");
+    }
+
+    void SetCaptureDocumentBackground(bool black, CapturePhase next_phase) {
+        if (!webview_) return;
+        capture_in_flight_ = true;
+        auto completion = Callback<ICoreWebView2ExecuteScriptCompletedHandler>(
+            [this, next_phase](HRESULT error_code, LPCWSTR) -> HRESULT {
+                capture_in_flight_ = false;
+                if (SUCCEEDED(error_code)) {
+                    capture_phase_ = next_phase;
+                } else {
+                    capture_phase_ = CapturePhase::SetBlack;
+                    ++capture_failure_count_;
+                }
+                return S_OK;
+            });
+        const wchar_t* script = black
+            ? L"document.documentElement.style.setProperty('background-color','rgb(0,0,0)','important')"
+            : L"document.documentElement.style.setProperty('background-color','rgb(255,255,255)','important')";
+        const HRESULT result = webview_->ExecuteScript(script, completion.Get());
+        if (FAILED(result)) {
+            capture_in_flight_ = false;
+            capture_phase_ = CapturePhase::SetBlack;
+            ++capture_failure_count_;
+        }
+    }
+
+    void HandleCaptureTick() {
+        if (!g_backbuffer_capture_enabled.load(std::memory_order_acquire)) return;
+        if (capture_in_flight_ || !webview_ || !wic_factory_ ||
+            g_state.load(std::memory_order_acquire) != State::DomReady) {
+            return;
+        }
+
+        if (!composition_tree_detached_) {
+            // The WebView is mirrored into the game's swapchain. Disconnect its
+            // DirectComposition tree entirely so black/white reconstruction passes
+            // can never cover the game window even if a newer visual interface is
+            // unavailable on the current Windows build.
+            if (composition_target_) (void)composition_target_->SetRoot(nullptr);
+            if (composition_device_) (void)composition_device_->Commit();
+            composition_tree_detached_ = true;
+        }
+
+        if (capture_phase_ == CapturePhase::SetBlack ||
+            capture_phase_ == CapturePhase::SetWhite) {
+            const bool set_black = capture_phase_ == CapturePhase::SetBlack;
+            SetCaptureDocumentBackground(
+                set_black,
+                set_black ? CapturePhase::CaptureBlack : CapturePhase::CaptureWhite);
+            return;
+        }
+
+        ComPtr<IStream> stream;
+        HRESULT result = CreateStreamOnHGlobal(nullptr, TRUE, &stream);
+        if (FAILED(result) || !stream) return;
+        capture_in_flight_ = true;
+
+        if (capture_phase_ == CapturePhase::CaptureWhite) {
+            auto completion = Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                [this, stream](HRESULT error_code) -> HRESULT {
+                    capture_in_flight_ = false;
+                    CapturedFrame white_frame;
+                    CapturedFrame frame;
+                    if (FAILED(error_code) ||
+                        !DecodeCapturedPng(wic_factory_.Get(), stream.Get(), white_frame)) {
+                        pending_black_frame_ = {};
+                        SetCaptureDocumentBackground(true, CapturePhase::CaptureBlack);
+                        ++capture_failure_count_;
+                        return S_OK;
+                    }
+                    if (!BackgroundPairIsReady(pending_black_frame_, white_frame)) {
+                        // The DOM style is set but Chromium has not composited it yet.
+                        // Keep the black reference and retry the white capture next tick.
+                        return S_OK;
+                    }
+                    if (!ReconstructTransparentFrame(pending_black_frame_, white_frame, frame)) {
+                        pending_black_frame_ = {};
+                        SetCaptureDocumentBackground(true, CapturePhase::CaptureBlack);
+                        ++capture_failure_count_;
+                        return S_OK;
+                    }
+                    pending_black_frame_ = {};
+                    capture_failure_count_ = 0;
+                    const auto width = frame.width;
+                    const auto height = frame.height;
+                    PublishCapturedFrame(std::move(frame));
+                    if (!backbuffer_mirror_active_) {
+                        backbuffer_mirror_active_ = true;
+                        Log(logging::Level::Info,
+                            "WebView2 dual-background back-buffer mirror active at " +
+                                std::to_string(width) + "x" + std::to_string(height));
+                    }
+                    SetCaptureDocumentBackground(true, CapturePhase::CaptureBlack);
+                    return S_OK;
+                });
+            result = webview_->CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, stream.Get(), completion.Get());
+        } else {
+            auto completion = Callback<ICoreWebView2CapturePreviewCompletedHandler>(
+                [this, stream](HRESULT error_code) -> HRESULT {
+                    capture_in_flight_ = false;
+                    CapturedFrame black_frame;
+                    if (FAILED(error_code) ||
+                        !DecodeCapturedPng(wic_factory_.Get(), stream.Get(), black_frame)) {
+                        ++capture_failure_count_;
+                        return S_OK;
+                    }
+                    if (!LooksLikeOpaqueBlackBackground(black_frame)) return S_OK;
+                    pending_black_frame_ = std::move(black_frame);
+                    SetCaptureDocumentBackground(false, CapturePhase::CaptureWhite);
+                    return S_OK;
+                });
+            result = webview_->CapturePreview(
+                COREWEBVIEW2_CAPTURE_PREVIEW_IMAGE_FORMAT_PNG, stream.Get(), completion.Get());
+        }
+        if (FAILED(result)) {
+            capture_in_flight_ = false;
+            pending_black_frame_ = {};
+            capture_phase_ = CapturePhase::SetBlack;
+            ++capture_failure_count_;
+            if (capture_failure_count_ <= 4 ||
+                (capture_failure_count_ & (capture_failure_count_ - 1)) == 0) {
+                Log(logging::Level::Warning,
+                    "WebView2 dual-background CapturePreview request failed: " + HResultText(result));
+            }
+        }
     }
 
     void HandleSettings(bool open) {
@@ -876,6 +1179,7 @@ public:
     void Shutdown() noexcept {
         if (shutdown_) return;
         shutdown_ = true;
+        ClearCapturedFrame();
         g_accept_lcstats.store(false, std::memory_order_release);
         lcstats_client_.Stop();
         if (g_process_detaching.load(std::memory_order_acquire)) {
@@ -1336,6 +1640,14 @@ private:
     bool shutdown_ = false;
     bool settings_open_on_sta_ = false;
     bool open_hint_shown_ = false;
+    bool capture_in_flight_ = false;
+    bool backbuffer_mirror_active_ = false;
+    bool composition_tree_detached_ = false;
+    bool capture_bounds_valid_ = false;
+    RECT capture_bounds_{};
+    CapturePhase capture_phase_ = CapturePhase::SetBlack;
+    CapturedFrame pending_black_frame_;
+    std::uint64_t capture_failure_count_ = 0;
     std::filesystem::path asset_root_;
     std::filesystem::path module_root_;
     std::filesystem::path config_root_;
@@ -1348,6 +1660,7 @@ private:
     ComPtr<ICoreWebView2CompositionController> composition_controller_;
     ComPtr<ICoreWebView2Controller> controller_;
     ComPtr<ICoreWebView2> webview_;
+    ComPtr<IWICImagingFactory> wic_factory_;
     EventRegistrationToken web_message_token_{};
     EventRegistrationToken navigation_token_{};
     EventRegistrationToken new_window_token_{};
@@ -1404,10 +1717,9 @@ DWORD WINAPI ThreadMain(void*) {
         g_state.store(State::Failed, std::memory_order_release);
         Log(logging::Level::Error, "WebView2 host initialization failed: " + HResultText(initialize_result));
     } else {
-        const UINT_PTR focus_hint_timer =
-            SetTimer(nullptr, 0, kFocusHintPollIntervalMs, nullptr);
-        if (focus_hint_timer == 0) {
-            Log(logging::Level::Warning, "First-focus hint timer could not be started");
+        const UINT_PTR host_timer = SetTimer(nullptr, 0, kHostTimerIntervalMs, nullptr);
+        if (host_timer == 0) {
+            Log(logging::Level::Warning, "WebView host timer could not be started");
         }
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
@@ -1420,8 +1732,9 @@ DWORD WINAPI ThreadMain(void*) {
                 continue;
             }
             if (message.hwnd == nullptr && message.message == WM_TIMER &&
-                message.wParam == focus_hint_timer) {
+                message.wParam == host_timer) {
                 host.HandleFocusHint();
+                host.HandleCaptureTick();
                 continue;
             }
             if (message.hwnd == nullptr && message.message == kMessageSettings) {
@@ -1458,7 +1771,7 @@ DWORD WINAPI ThreadMain(void*) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
-        if (focus_hint_timer != 0) (void)KillTimer(nullptr, focus_hint_timer);
+        if (host_timer != 0) (void)KillTimer(nullptr, host_timer);
     }
 
     host.Shutdown();
@@ -1668,6 +1981,31 @@ const char* StateName() noexcept {
 HCURSOR CurrentCursor() noexcept {
     HCURSOR cursor = g_cursor.load(std::memory_order_acquire);
     return cursor != nullptr ? cursor : LoadCursorW(nullptr, IDC_ARROW);
+}
+
+bool CopyLatestCapturedFrame(
+    std::uint64_t known_generation,
+    CapturedFrame& frame) noexcept {
+    try {
+        std::scoped_lock lock(g_captured_frame_mutex);
+        if (g_captured_frame.generation == 0 ||
+            g_captured_frame.generation == known_generation) {
+            return false;
+        }
+        frame = g_captured_frame;
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+void SetBackBufferCaptureEnabled(bool enabled) noexcept {
+    const bool previous = g_backbuffer_capture_enabled.exchange(enabled, std::memory_order_acq_rel);
+    if (previous && !enabled) ClearCapturedFrame();
+}
+
+bool BackBufferCaptureEnabled() noexcept {
+    return g_backbuffer_capture_enabled.load(std::memory_order_acquire);
 }
 
 }  // namespace hq::overlay::webview
