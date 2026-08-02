@@ -1,0 +1,7 @@
+/.vs/
+/bin/
+/obj/
+*.user
+*.suo
+
+# dist/ is intentionally tracked: it contains the ready-to-inject Release pair.

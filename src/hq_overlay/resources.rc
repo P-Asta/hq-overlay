@@ -1,0 +1,5 @@
+#include <winres.h>
+
+// Production delivery is a single DLL. HQ_OVERLAY_HTML remains available as
+// an explicit development override, but this resource is the normal shell.
+101 RCDATA "../../assets/overlay.html"

@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64"><Configuration>Debug</Configuration><Platform>x64</Platform></ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64"><Configuration>Release</Configuration><Platform>x64</Platform></ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{F8CF50EB-5B82-4C4C-AC24-84F7D76BB46E}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword><RootNamespace>hq_overlay</RootNamespace><ProjectName>hq_overlay</ProjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>true</UseDebugLibraries>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType><UseDebugLibraries>false</UseDebugLibraries><WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <PreprocessorDefinitions>HQ_OVERLAY_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(SolutionDir)src\common;$(SolutionDir)src\hq_overlay;$(SolutionDir)third_party\minhook\include;$(SolutionDir)third_party\imgui;$(SolutionDir)third_party\webview2\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem><TargetMachine>MachineX64</TargetMachine>
+      <AdditionalLibraryDirectories>$(SolutionDir)third_party\webview2\lib\x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>WebView2LoaderStatic.lib;d3d11.lib;dxgi.lib;dcomp.lib;user32.lib;shell32.lib;ole32.lib;advapi32.lib;uuid.lib;winhttp.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="$(SolutionDir)src\common\config.cpp" />
+    <ClCompile Include="$(SolutionDir)src\common\logging.cpp" />
+    <ClCompile Include="$(SolutionDir)src\hq_overlay\dllmain.cpp" />
+    <ClCompile Include="$(SolutionDir)src\hq_overlay\lcstats_client.cpp" />
+    <ClCompile Include="$(SolutionDir)src\hq_overlay\overlay_runtime.cpp" />
+    <ClCompile Include="$(SolutionDir)src\hq_overlay\webview_overlay.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="$(SolutionDir)src\common\config.hpp" />
+    <ClInclude Include="$(SolutionDir)src\common\logging.hpp" />
+    <ClInclude Include="$(SolutionDir)src\hq_overlay\lcstats_client.hpp" />
+    <ClInclude Include="$(SolutionDir)src\hq_overlay\overlay_runtime.hpp" />
+    <ClInclude Include="$(SolutionDir)src\hq_overlay\webview_overlay.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="$(SolutionDir)src\hq_overlay\resources.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="imgui.vcxproj"><Project>{FE3FC12F-C2B8-4D02-9D9D-E3217D75BBAE}</Project></ProjectReference>
+    <ProjectReference Include="minhook.vcxproj"><Project>{86B10E12-9B5B-4BE0-A8F4-0D58ABF25768}</Project></ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>
