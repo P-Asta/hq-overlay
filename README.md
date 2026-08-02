@@ -15,6 +15,7 @@ The launcher's existing external WebView overlay remains available as the **lega
 - The same React `GameOverlay` HUD and settings panel used by the legacy renderer; there is no second native-looking settings implementation.
 - Runtime loading and evaluation of `%APPDATA%\asta.hq-launcher\overlayModule\*.js`, including nested module configuration reads/writes under `config\overlay`.
 - Module shortcut, mouse, focus, controls-open, active-state, diagnostics, folder-open, and LCStats message bridges between the embedded page and the native host.
+- Keyboard input remains pass-through to the game while the settings UI is open; only mouse input is captured for overlay controls.
 - Minimal loader-lock entry: `DllMain` only disables thread callbacks and starts a bootstrap worker. Hook setup, WebView2/COM creation, configuration and module I/O, and waits run outside `DllMain`.
 - WndProc chaining with HWND-scoped resident forwarders. A forwarding entry is removed only after a verified head restore; if a newer hook is ahead, HQ remains a safe downstream link for the resident DLL lifetime.
 - PID-scoped ready/disable/shutdown events and an exported soft-disable API.

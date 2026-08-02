@@ -45,7 +45,6 @@ std::atomic_bool g_soft_disabled{false};
 std::atomic_bool g_ready{false};
 std::atomic_bool g_imgui_input_ready{false};
 std::atomic_bool g_panel_open{false};
-std::atomic_bool g_game_input_suspended{false};
 std::atomic_int g_cursor_visibility_adjustments{0};
 std::atomic_bool g_crosshair_toggle_requested{false};
 std::atomic_bool g_config_reload_requested{false};
@@ -559,24 +558,14 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
     if (original == &HookWindowProcedure) original = nullptr;
     const UINT restore_focus_message = webview::RestoreGameFocusMessage();
     if (restore_focus_message != 0 && message == restore_focus_message) {
-        const bool was_suspended = g_game_input_suspended.exchange(false, std::memory_order_acq_rel);
         int cursor_adjustments = g_cursor_visibility_adjustments.exchange(0, std::memory_order_acq_rel);
         while (cursor_adjustments-- > 0) (void)ShowCursor(FALSE);
-        if (GetFocus() != window) {
-            (void)SetFocus(window);
-        } else if (was_suspended && original != nullptr) {
-            // A composition WebView has no child HWND, so the OS focus can
-            // remain on the game while its input is intentionally suspended.
-            // Restore the matching focus notification when the panel closes.
-            (void)CallWindowProcW(original, window, WM_SETFOCUS, 0, 0);
-        }
+        if (GetFocus() != window) (void)SetFocus(window);
         return 0;
     }
     const bool key_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
-    const bool key_message = message >= WM_KEYFIRST && message <= WM_KEYLAST;
     const bool mouse_message = (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) || message == WM_MOUSELEAVE;
     const bool key_repeat = (static_cast<std::uintptr_t>(lparam) & (1ULL << 30U)) != 0;
-    bool overlay_hotkey_handled = false;
 
     const auto current_modifier_mask = [] {
         std::uint8_t modifiers = 0;
@@ -600,10 +589,11 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
                                      : g_panel_open.load(std::memory_order_acquire);
             const bool next = !current;
             g_panel_open.store(next, std::memory_order_release);
-            if (next && !g_game_input_suspended.exchange(true, std::memory_order_acq_rel)) {
-                // Match an in-game platform overlay: release mouse confinement
-                // and tell the game it no longer owns keyboard/mouse focus while
-                // the composition-hosted settings UI remains interactive.
+            if (next) {
+                // Release mouse confinement for the composition-hosted settings
+                // UI, but keep the game's keyboard focus and key state intact.
+                // Synthetic WM_KILLFOCUS/WM_SETFOCUS messages make Unity clear
+                // held keys, which feels like intermittent keyboard drop-outs.
                 if (GetCapture() == window) ReleaseCapture();
                 (void)ClipCursor(nullptr);
                 int cursor_adjustments = 0;
@@ -613,13 +603,8 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
                 }
                 g_cursor_visibility_adjustments.store(cursor_adjustments, std::memory_order_release);
                 (void)SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-                if (original != nullptr) {
-                    (void)CallWindowProcW(original, window, WM_CANCELMODE, 0, 0);
-                    (void)CallWindowProcW(original, window, WM_KILLFOCUS, 0, 0);
-                }
             }
             webview::SetSettingsOpen(next);
-            overlay_hotkey_handled = true;
         }
         const std::uint32_t crosshair_key = g_crosshair_hotkey.load(std::memory_order_acquire);
         if (crosshair_key != 0 && virtual_key == crosshair_key) {
@@ -637,13 +622,27 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
 
     if (webview::IsDomReady() && webview::WantsInput()) {
         if (message == WM_INPUT) {
-            // Unity consumes raw mouse/keyboard packets independently of the
-            // legacy WM_KEY/WM_MOUSE messages. Do the required foreground raw
-            // input cleanup, but do not forward the packet into the game.
-            if (GET_RAWINPUT_CODE_WPARAM(wparam) == RIM_INPUT) {
-                (void)DefWindowProcW(window, message, wparam, lparam);
+            // The settings UI captures the mouse, but keyboard packets must
+            // continue down the game's WndProc chain. Unity reads keyboard
+            // state from WM_INPUT independently of the legacy WM_KEY messages.
+            // Dropping these packets clears or interrupts held movement keys.
+            RAWINPUTHEADER header{};
+            UINT header_size = sizeof(header);
+            const UINT read = GetRawInputData(
+                reinterpret_cast<HRAWINPUT>(lparam),
+                RID_HEADER,
+                &header,
+                &header_size,
+                sizeof(RAWINPUTHEADER));
+            const bool keyboard_input = read == sizeof(header) && header.dwType == RIM_TYPEKEYBOARD;
+            if (!keyboard_input) {
+                // Foreground raw input that is not forwarded must still be
+                // cleaned up through DefWindowProc as required by Win32.
+                if (GET_RAWINPUT_CODE_WPARAM(wparam) == RIM_INPUT) {
+                    (void)DefWindowProcW(window, message, wparam, lparam);
+                }
+                return 0;
             }
-            return 0;
         }
         if (message == WM_SETCURSOR) {
             HCURSOR cursor = webview::CurrentCursor();
@@ -668,11 +667,9 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
             }
             if (webview::ForwardMouseMessage(window, message, wparam, lparam)) return 0;
         }
-        if (key_message || overlay_hotkey_handled) {
-            return 1;
-        }
+        // Keyboard input is observational: WebView2 may process it while the
+        // settings panel is open, but the game must receive the same message.
     }
-    if (overlay_hotkey_handled && webview::IsDomReady()) return 1;
     // WndProc and Present may run on different game threads. A non-blocking
     // lock prevents concurrent ImGui access without risking a synchronous
     // window-message deadlock; the original chain still receives the message.
@@ -682,7 +679,7 @@ LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, L
         const LRESULT handled = ImGui_ImplWin32_WndProcHandler(window, message, wparam, lparam);
         if (g_panel_open.load(std::memory_order_acquire)) {
             const ImGuiIO& io = ImGui::GetIO();
-            if (handled != 0 || (mouse_message && io.WantCaptureMouse) || (key_message && io.WantCaptureKeyboard)) {
+            if (mouse_message && (handled != 0 || io.WantCaptureMouse)) {
                 return handled != 0 ? handled : 1;
             }
         }
