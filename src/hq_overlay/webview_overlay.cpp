@@ -44,6 +44,8 @@ constexpr UINT kMessageSettings = WM_APP + 0x543;
 constexpr UINT kMessageMouse = WM_APP + 0x544;
 constexpr UINT kMessageShortcut = WM_APP + 0x545;
 constexpr UINT kMessageLcStats = WM_APP + 0x546;
+constexpr UINT kFocusHintPollIntervalMs = 250;
+constexpr UINT kFocusHintDurationMs = 10000;
 constexpr UINT kEmbeddedOverlayResourceId = 101;
 constexpr std::uintmax_t kMaximumRpcFileSize = 16U * 1024U * 1024U;
 constexpr wchar_t kApplicationHost[] = L"hq-overlay.local";
@@ -759,9 +761,30 @@ public:
         if (composition_device_) (void)composition_device_->Commit();
     }
 
+    void HandleFocusHint() {
+        if (open_hint_shown_ || !webview_ ||
+            g_state.load(std::memory_order_acquire) != State::DomReady) {
+            return;
+        }
+        if (settings_open_on_sta_) {
+            open_hint_shown_ = true;
+            return;
+        }
+        if (window_ == nullptr || !IsWindow(window_) || GetForegroundWindow() != window_) return;
+
+        open_hint_shown_ = true;
+        PostEvent(
+            "overlay://open-config-hint",
+            "{\"durationMs\":" + std::to_string(kFocusHintDurationMs) + "}");
+        Log(logging::Level::Info, "Displayed first-focus overlay settings hotkey hint");
+    }
+
     void HandleSettings(bool open) {
         const bool was_open = settings_open_on_sta_;
         settings_open_on_sta_ = open;
+        if (open) {
+            open_hint_shown_ = true;
+        }
         g_settings_open.store(open, std::memory_order_release);
         g_controls_enabled.store(open, std::memory_order_release);
         if (webview_) {
@@ -1312,6 +1335,7 @@ private:
     bool settings_hotkey_down_ = false;
     bool shutdown_ = false;
     bool settings_open_on_sta_ = false;
+    bool open_hint_shown_ = false;
     std::filesystem::path asset_root_;
     std::filesystem::path module_root_;
     std::filesystem::path config_root_;
@@ -1380,6 +1404,11 @@ DWORD WINAPI ThreadMain(void*) {
         g_state.store(State::Failed, std::memory_order_release);
         Log(logging::Level::Error, "WebView2 host initialization failed: " + HResultText(initialize_result));
     } else {
+        const UINT_PTR focus_hint_timer =
+            SetTimer(nullptr, 0, kFocusHintPollIntervalMs, nullptr);
+        if (focus_hint_timer == 0) {
+            Log(logging::Level::Warning, "First-focus hint timer could not be started");
+        }
         MSG message{};
         while (GetMessageW(&message, nullptr, 0, 0) > 0) {
             if (message.hwnd == nullptr && message.message == kMessageStop) {
@@ -1388,6 +1417,11 @@ DWORD WINAPI ThreadMain(void*) {
             }
             if (message.hwnd == nullptr && message.message == kMessageBounds) {
                 host.HandleBounds();
+                continue;
+            }
+            if (message.hwnd == nullptr && message.message == WM_TIMER &&
+                message.wParam == focus_hint_timer) {
+                host.HandleFocusHint();
                 continue;
             }
             if (message.hwnd == nullptr && message.message == kMessageSettings) {
@@ -1424,6 +1458,7 @@ DWORD WINAPI ThreadMain(void*) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
         }
+        if (focus_hint_timer != 0) (void)KillTimer(nullptr, focus_hint_timer);
     }
 
     host.Shutdown();
