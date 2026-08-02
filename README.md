@@ -10,6 +10,7 @@ The launcher's existing external WebView overlay remains available as the **lega
 
 - D3D11 swapchain discovery and process-owned top-level target-window selection.
 - `Present` and `ResizeBuffers` hooks used to initialize the native window integration and keep WebView bounds synchronized.
+- DXGI exclusive fullscreen is normalized to same-monitor borderless fullscreen because DirectComposition HTML visuals cannot be displayed through the exclusive presentation path.
 - DirectComposition + `ICoreWebView2CompositionController` rendering directly on the game HWND with a transparent background.
 - The same React `GameOverlay` HUD and settings panel used by the legacy renderer; there is no second native-looking settings implementation.
 - Runtime loading and evaluation of `%APPDATA%\asta.hq-launcher\overlayModule\*.js`, including nested module configuration reads/writes under `config\overlay`.

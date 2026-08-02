@@ -48,6 +48,7 @@ std::atomic_bool g_panel_open{false};
 std::atomic_bool g_crosshair_toggle_requested{false};
 std::atomic_bool g_config_reload_requested{false};
 std::atomic_bool g_window_invalidated{false};
+std::atomic_bool g_exclusive_fullscreen_converted{false};
 std::atomic_uint32_t g_overlay_hotkey{VK_INSERT};
 std::atomic<std::uint8_t> g_overlay_hotkey_modifiers{0};
 std::atomic_uint32_t g_crosshair_hotkey{0};
@@ -768,6 +769,79 @@ void ShutdownRenderer() {
     return SUCCEEDED(swap_chain->GetDevice(IID_PPV_ARGS(&device))) && device != nullptr;
 }
 
+// A WebView2 composition controller is presented through DirectComposition.
+// DXGI exclusive fullscreen bypasses the desktop compositor, so its visual can
+// never appear above the game's back buffer. Preserve the fullscreen look by
+// moving the swap chain back to windowed mode and sizing its HWND to the output.
+// This also covers games that enter exclusive mode after the renderer started.
+void NormalizeExclusiveFullscreen(IDXGISwapChain* swap_chain) {
+    if (swap_chain == nullptr) return;
+
+    BOOL exclusive = FALSE;
+    ComPtr<IDXGIOutput> output;
+    const HRESULT state_result = swap_chain->GetFullscreenState(&exclusive, &output);
+    if (FAILED(state_result) || exclusive == FALSE) return;
+
+    DXGI_SWAP_CHAIN_DESC description{};
+    if (FAILED(swap_chain->GetDesc(&description)) || description.OutputWindow == nullptr) return;
+
+    RECT target{};
+    bool have_target = false;
+    if (output) {
+        DXGI_OUTPUT_DESC output_description{};
+        if (SUCCEEDED(output->GetDesc(&output_description))) {
+            target = output_description.DesktopCoordinates;
+            have_target = true;
+        }
+    }
+    if (!have_target) {
+        MONITORINFO monitor_info{};
+        monitor_info.cbSize = sizeof(monitor_info);
+        const HMONITOR monitor = MonitorFromWindow(description.OutputWindow, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr && GetMonitorInfoW(monitor, &monitor_info)) {
+            target = monitor_info.rcMonitor;
+            have_target = true;
+        }
+    }
+
+    const HRESULT windowed_result = swap_chain->SetFullscreenState(FALSE, nullptr);
+    if (FAILED(windowed_result)) {
+        if (!g_exclusive_fullscreen_converted.exchange(true, std::memory_order_acq_rel)) {
+            logging::Write(
+                logging::Level::Warning,
+                "DXGI exclusive fullscreen could not be converted; HTML overlay composition is unavailable");
+        }
+        return;
+    }
+
+    const HWND window = description.OutputWindow;
+    LONG_PTR style = GetWindowLongPtrW(window, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_VISIBLE;
+    (void)SetWindowLongPtrW(window, GWL_STYLE, style);
+
+    LONG_PTR extended_style = GetWindowLongPtrW(window, GWL_EXSTYLE);
+    extended_style &= ~(WS_EX_DLGMODALFRAME | WS_EX_CLIENTEDGE | WS_EX_STATICEDGE | WS_EX_WINDOWEDGE);
+    (void)SetWindowLongPtrW(window, GWL_EXSTYLE, extended_style);
+    if (have_target) {
+        (void)SetWindowPos(
+            window,
+            HWND_TOP,
+            target.left,
+            target.top,
+            target.right - target.left,
+            target.bottom - target.top,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+    webview::UpdateBounds();
+
+    if (!g_exclusive_fullscreen_converted.exchange(true, std::memory_order_acq_rel)) {
+        logging::Write(
+            logging::Level::Info,
+            "Converted DXGI exclusive fullscreen to borderless fullscreen for HTML overlay composition");
+    }
+}
+
 [[nodiscard]] bool InitializeRenderer(IDXGISwapChain* swap_chain) {
     if (g_soft_disabled.load(std::memory_order_acquire) || ExternalDisableSignaled()) return false;
 
@@ -849,6 +923,7 @@ HRESULT WINAPI HookPresent(IDXGISwapChain* swap_chain, UINT sync_interval, UINT 
     reentrant = true;
     try {
         if (ExternalDisableSignaled()) RequestSoftDisable("named disable/shutdown event");
+        if ((flags & DXGI_PRESENT_TEST) == 0) NormalizeExclusiveFullscreen(swap_chain);
 
         {
             std::scoped_lock lock(g_renderer_mutex);
