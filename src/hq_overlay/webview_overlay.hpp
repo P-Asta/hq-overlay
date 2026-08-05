@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace hq::overlay::webview {
@@ -39,6 +40,12 @@ void SetSettingsOpen(bool open) noexcept;
 void SetSettingsHotkey(UINT virtual_key, std::uint8_t modifiers) noexcept;
 void SetBackBufferCaptureEnabled(bool enabled) noexcept;
 [[nodiscard]] bool BackBufferCaptureEnabled() noexcept;
+
+// Hands a LCStatsTracker raw stats JSON (read from the launcher's relay file)
+// to the STA thread through the same queue used by the SSE client. Safe to call
+// from the config poller thread; the payload is validated + de-duplicated on
+// the STA thread by HandleLcStats.
+void EnqueueLcStatsFilePayload(std::string raw_json) noexcept;
 
 // A registered window message posted back to the game HWND when WebView focus
 // must be released. The game WndProc handles it on its owning thread.

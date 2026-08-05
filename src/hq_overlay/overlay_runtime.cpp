@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iterator>
 #include <mutex>
@@ -257,6 +258,37 @@ void PollConfigurationOnWorker(bool force) {
     g_crosshair_hotkey.store(crosshair_hotkey, std::memory_order_release);
 }
 
+// Polls the launcher's LCStatsTracker relay file alongside the config poll. The
+// launcher writes <config-root>/lcstats.json whenever it receives the day's
+// stats over SSE — a dependable source the C# SSE server's lossy request-per-
+// packet delivery cannot guarantee for the overlay. We only re-load when the
+// file mtime changes, and only mark it consumed after a successful read so a
+// partial write during the launcher's std::fs::write is retried next tick.
+void PollLcStatsOnWorker() {
+    static std::filesystem::file_time_type last_consumed{};
+    const auto path = config::DefaultOverlayConfigRoot() / L"lcstats.json";
+    const auto mtime = FileTimestamp(path);
+    if (mtime == last_consumed) return;
+
+    std::ifstream file(path, std::ios::binary);
+    if (!file) return;  // missing or unreadable; try again next tick
+    std::string content((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    if (content.size() >= 3 && static_cast<unsigned char>(content[0]) == 0xEFU &&
+        static_cast<unsigned char>(content[1]) == 0xBBU &&
+        static_cast<unsigned char>(content[2]) == 0xBFU) {
+        content.erase(0, 3);
+    }
+    while (!content.empty() &&
+           (content.back() == '\n' || content.back() == '\r' || content.back() == ' ' ||
+            content.back() == '\t')) {
+        content.pop_back();
+    }
+    constexpr std::size_t kMaximumLcStatsFileBytes = 8U * 1024U * 1024U;
+    if (content.empty() || content.size() > kMaximumLcStatsFileBytes) return;
+    webview::EnqueueLcStatsFilePayload(std::move(content));
+    last_consumed = mtime;
+}
+
 void ApplyPreparedConfiguration() {
     config::LoadResult loaded;
     std::uint64_t generation = 0;
@@ -280,6 +312,11 @@ void ApplyPreparedConfiguration() {
 }
 
 void PromoteWebViewReady() {
+    // Fast path: this runs on every Present, and almost every frame the overlay
+    // is already ready. Skip the mutex in the steady state to avoid taking a
+    // kernel lock at frame rate. We only need the lock for the readiness
+    // transition itself and for reflecting panel-open state.
+    if (g_ready.load(std::memory_order_acquire)) return;
     std::scoped_lock transition_lock(g_ready_transition_mutex);
     if (g_soft_disabled.load(std::memory_order_acquire) ||
         g_process_detaching.load(std::memory_order_acquire) ||
@@ -466,12 +503,20 @@ void DrawSettingsPanel() {
 LRESULT CALLBACK HookWindowProcedure(HWND window, UINT message, WPARAM wparam, LPARAM lparam);
 
 [[nodiscard]] WNDPROC WindowProcedureForwarder(HWND window) {
+    // Fast path: the common case is a single hooked game window. Its HWND and
+    // original WndProc are published atomically, so we can resolve the forwarder
+    // without touching g_wndproc_chain_mutex. That lock was acquired on every
+    // window message (WM_MOUSEMOVE etc. fire hundreds of times per second) and
+    // contended with the render thread; skipping it removes per-message kernel
+    // transitions from the hot path.
+    if (g_hooked_window.load(std::memory_order_acquire) == window) {
+        const auto original = g_original_wndproc.load(std::memory_order_acquire);
+        if (original != 0) return reinterpret_cast<WNDPROC>(original);
+    }
+    // Fallback for the auxiliary map (multi-window / reinstall edge cases).
     std::scoped_lock lock(g_wndproc_chain_mutex);
     const auto entry = g_wndproc_forwarders.find(window);
     if (entry != g_wndproc_forwarders.end()) return entry->second;
-    if (g_hooked_window.load(std::memory_order_acquire) == window) {
-        return reinterpret_cast<WNDPROC>(g_original_wndproc.load(std::memory_order_acquire));
-    }
     return nullptr;
 }
 
@@ -1266,6 +1311,7 @@ DWORD WINAPI BootstrapThread(void* module_parameter) {
             if (result != WAIT_TIMEOUT) break;
             const bool force = g_config_reload_requested.exchange(false, std::memory_order_acq_rel);
             PollConfigurationOnWorker(force);
+            PollLcStatsOnWorker();
             PromoteWebViewReady();
         }
     }
