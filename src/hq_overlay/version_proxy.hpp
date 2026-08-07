@@ -12,6 +12,9 @@
 // transparent drop-in, every public export of the real system
 // `version.dll` (17 functions on Windows 10/11) is forwarded to the
 // genuine implementation loaded from `%SystemRoot%\System32\version.dll`.
+// On Wine/Proton, where the builtin VERSION.dll exports may be stubs, the
+// proxy intentionally reports "no version information" instead of invoking
+// an unimplemented export and terminating the process.
 //
 // The system module is resolved lazily and on demand: `Initialize` only
 // opens a handle, and each forwarder resolves its target address the

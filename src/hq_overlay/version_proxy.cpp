@@ -22,6 +22,32 @@ namespace {
 // threads (the host calls version.dll exports on its own threads).
 std::atomic<HMODULE> g_system_version{nullptr};
 
+// Wine/Proton may load this proxy as VERSION.dll, but its builtin VERSION.dll
+// exports are not consistently implemented across Proton versions. In that
+// environment forwarding into the builtin module can terminate the process
+// with an "unimplemented function" error. Returning the normal "no version
+// information" result is safe for a transparent proxy and keeps the overlay
+// alive.
+std::atomic<bool> g_wine_environment{false};
+
+bool IsWineEnvironment() noexcept {
+    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+    if (ntdll == nullptr) return false;
+    // wine_get_version is a Wine-only ntdll export. Resolve it dynamically so
+    // the Windows build has no dependency on Wine headers or libraries.
+    return GetProcAddress(ntdll, "wine_get_version") != nullptr;
+}
+
+HMODULE ThisProxyModule() noexcept {
+    HMODULE module = nullptr;
+    // The address of a function in this translation unit identifies this DLL.
+    // Do not increment the reference count; this is only an identity check.
+    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                       reinterpret_cast<LPCWSTR>(&ThisProxyModule), &module);
+    return module;
+}
+
 // Resolve the genuine system version.dll. Uses an absolute System32 path so
 // the lookup is pinned to %SystemRoot%\System32 regardless of the calling
 // process's DLL search order (otherwise this proxy would resolve to itself).
@@ -36,7 +62,14 @@ HMODULE LoadSystemVersionDll() noexcept {
     if (written <= 0 || written >= MAX_PATH) {
         return LoadLibraryExW(L"version.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     }
-    return LoadLibraryExW(full_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    HMODULE module = LoadLibraryExW(full_path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    // A DLL override can cause Wine to return the already-loaded proxy even
+    // for a system32 path. Never accept that handle as the forwarding target.
+    if (module == ThisProxyModule()) {
+        FreeLibrary(module);
+        return nullptr;
+    }
+    return module;
 }
 
 HMODULE EnsureSystemVersionDll() noexcept {
@@ -60,6 +93,11 @@ HMODULE EnsureSystemVersionDll() noexcept {
 // Resolve a forwarder target by name from the genuine system version.dll.
 // Returns nullptr if the system module/export could not be found.
 void* ResolveExport(const char* name) noexcept {
+    if (IsWineEnvironment()) {
+        g_wine_environment.store(true, std::memory_order_release);
+        return nullptr;
+    }
+    if (g_wine_environment.load(std::memory_order_acquire)) return nullptr;
     HMODULE module = EnsureSystemVersionDll();
     if (module == nullptr) {
         logging::Write(logging::Level::Warning,
@@ -77,6 +115,10 @@ void* ResolveExport(const char* name) noexcept {
 }  // namespace
 
 void Initialize() noexcept {
+    if (IsWineEnvironment()) {
+        g_wine_environment.store(true, std::memory_order_release);
+        return;
+    }
     EnsureSystemVersionDll();
 }
 
