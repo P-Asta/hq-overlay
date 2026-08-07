@@ -34,6 +34,7 @@
     <ClCompile Include="$(SolutionDir)src\hq_overlay\dllmain.cpp" />
     <ClCompile Include="$(SolutionDir)src\hq_overlay\lcstats_client.cpp" />
     <ClCompile Include="$(SolutionDir)src\hq_overlay\overlay_runtime.cpp" />
+    <ClCompile Include="$(SolutionDir)src\hq_overlay\version_proxy.cpp" />
     <ClCompile Include="$(SolutionDir)src\hq_overlay\webview_overlay.cpp" />
   </ItemGroup>
   <ItemGroup>
@@ -41,6 +42,7 @@
     <ClInclude Include="$(SolutionDir)src\common\logging.hpp" />
     <ClInclude Include="$(SolutionDir)src\hq_overlay\lcstats_client.hpp" />
     <ClInclude Include="$(SolutionDir)src\hq_overlay\overlay_runtime.hpp" />
+    <ClInclude Include="$(SolutionDir)src\hq_overlay\version_proxy.hpp" />
     <ClInclude Include="$(SolutionDir)src\hq_overlay\webview_overlay.hpp" />
   </ItemGroup>
   <ItemGroup>
