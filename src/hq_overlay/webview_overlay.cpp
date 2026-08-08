@@ -717,17 +717,14 @@ public:
         std::filesystem::create_directories(user_data_root_, filesystem_error);
         if (filesystem_error) return HRESULT_FROM_WIN32(filesystem_error.value());
 
-        // Keep g_accept_lcstats enabled even if the SSE worker fails to start so
-        // the launcher's relay file (read from the config poller) can still reach
-        // HandleLcStats. The SSE stream is a best-effort secondary channel; the
-        // relay file is the dependable source.
+        // The launcher's AutoSheet listener must be the exclusive consumer of
+        // LCStatsTracker's one-shot localhost:2145 stream. A second consumer here
+        // can win the request race and leave the launcher (and therefore the
+        // sheet) with an empty response. The launcher relays every received
+        // payload through config/overlay/lcstats.json instead.
         g_accept_lcstats.store(true, std::memory_order_release);
-        if (!lcstats_client_.Start(QueueLcStatsUpdate)) {
-            Log(logging::Level::Warning,
-               "LCStatsTracker SSE worker could not be started; relying on relay file");
-        } else {
-            Log(logging::Level::Info, "LCStatsTracker SSE worker started for localhost:2145");
-        }
+        Log(logging::Level::Info,
+            "LCStatsTracker relay enabled; launcher is the exclusive localhost:2145 consumer");
 
         HRESULT result = CreateCompositionTree();
         if (FAILED(result)) return result;
@@ -844,13 +841,11 @@ public:
         std::string raw_json = Trim(update.raw_json);
         if (raw_json.empty() || raw_json.size() > kMaximumRpcFileSize ||
             !JsonValidator(raw_json).Parse() || Utf8ToWide(raw_json).empty()) {
-            Log(logging::Level::Warning, "LCStatsTracker SSE payload ignored because it is not valid UTF-8 JSON");
+            Log(logging::Level::Warning, "LCStatsTracker relay payload ignored because it is not valid UTF-8 JSON");
             return;
         }
-        // De-duplicate across delivery channels. The SSE stream and the
-        // launcher's relay file can both surface the same day's payload; once it
-        // has been processed, an identical raw body is ignored so the overlay
-        // shows each day exactly once.
+        // The config poller can observe the same relay file more than once.
+        // Ignore an identical raw body so the overlay shows each day once.
         if (raw_json == last_raw_lcstats_json_) return;
         last_raw_lcstats_json_ = raw_json;
         latest_lcstats_payload_ = BuildLcStatsPayload(raw_json, update.received_at_unix_ms, true);
@@ -864,12 +859,6 @@ public:
         if (shutdown_) return;
         shutdown_ = true;
         g_accept_lcstats.store(false, std::memory_order_release);
-        lcstats_client_.Stop();
-        if (g_process_detaching.load(std::memory_order_acquire)) {
-            lcstats_client_.AbandonForProcessTermination();
-        } else if (!lcstats_client_.WaitUntilStopped(std::chrono::milliseconds(2500))) {
-            Log(logging::Level::Warning, "LCStatsTracker SSE worker did not stop within 2500 ms");
-        }
         try {
             if (webview_ && g_state.load(std::memory_order_acquire) == State::DomReady) {
                 PostEvent("overlay://active-changed", "false");
@@ -1343,7 +1332,6 @@ private:
     std::uint64_t shortcut_sequence_ = 0;
     std::uint64_t mouse_failure_count_ = 0;
     std::vector<std::string> down_shortcuts_;
-    hq::lcstats::Client lcstats_client_;
     std::string latest_lcstats_payload_;
     std::string latest_lcstats_event_;
     std::string last_raw_lcstats_json_;
@@ -1427,7 +1415,7 @@ DWORD WINAPI ThreadMain(void*) {
                     try {
                         host.HandleLcStats(std::move(input->update));
                     } catch (...) {
-                        Log(logging::Level::Warning, "LCStatsTracker SSE payload processing failed");
+                        Log(logging::Level::Warning, "LCStatsTracker relay payload processing failed");
                     }
                 }
                 continue;
@@ -1569,8 +1557,8 @@ void SetSettingsHotkey(UINT virtual_key, std::uint8_t modifiers) noexcept {
 }
 
 void EnqueueLcStatsFilePayload(std::string raw_json) noexcept {
-    // Reached from the config poller thread. Hand off to the STA thread via the
-    // same queue the SSE client uses; HandleLcStats validates and de-duplicates.
+    // Reached from the config poller thread. Hand off to the STA thread;
+    // HandleLcStats validates and de-duplicates the relay payload.
     const auto since_epoch = std::chrono::system_clock::now().time_since_epoch();
     const auto unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(since_epoch).count();
     hq::lcstats::Update update;
